@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+run.json
+*.tmp
+.venv/
+*.jpg
+*.jpeg
+*.png
