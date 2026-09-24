@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fetch the newest (clear) Sentinel-2 L2A satellite image for a place or coordinate.
+"""Fetch the newest clear Sentinel-2 or Landsat 8/9 image for a place or coordinate.
 
 Free, keyless stack:
   - geocoding:  Open-Meteo Geocoding API
   - imagery:    Copernicus Sentinel-2 Level-2A via Element 84 Earth Search (STAC v1)
+  - fallback:   USGS Landsat Collection 2 Level-2 via Microsoft Planetary Computer
 
 Writes a JPEG/PNG into ~/.hermes/cache/satellite-imagery/ and prints the
 acquisition metadata. Never claims imagery is live.
@@ -13,9 +14,11 @@ import json
 import math
 import os
 import sys
+import tempfile
 import time
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
+from urllib.parse import urlsplit
 
 import numpy as np
 import requests
@@ -27,11 +30,16 @@ from rasterio.warp import transform_bounds
 from rasterio.windows import Window, from_bounds
 
 EARTH_SEARCH = "https://earth-search.aws.element84.com/v1/search"
+PLANETARY_SEARCH = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
+PLANETARY_TOKEN = "https://planetarycomputer.microsoft.com/api/sas/v1/token/landsat-c2-l2"
 GEOCODING = "https://geocoding-api.open-meteo.com/v1/search"
 COLLECTION = "sentinel-2-c1-l2a"
+LANDSAT_COLLECTION = "landsat-c2-l2"
 OBSCURED_SCL = [3, 8, 9, 10, 11]
+OBSCURED_LANDSAT_BITS = sum(1 << bit for bit in (1, 2, 3, 4, 5))
 CACHE_DIR = os.path.expanduser("~/.hermes/cache/satellite-imagery")
 ATTRIBUTION = "Copernicus Sentinel-2 Level-2A imagery via Element 84 Earth Search"
+LANDSAT_ATTRIBUTION = "USGS Landsat Collection 2 Level-2 imagery via Microsoft Planetary Computer"
 
 # Place-like feature classes: a request for "Crater Lake" should prefer the lake
 # or its national park over "Crater Lake 511-002 Dam" 200 km away.
@@ -150,22 +158,56 @@ def bbox_from_center(lat, lon, radius_km=15):
     return [lon - lon_delta, lat - lat_delta, lon + lon_delta, lat + lat_delta]
 
 
-def search_scenes(bbox, days=60, limit=100, start=None, end=None):
+def _search_catalog(endpoint, collection, bbox, days=60, limit=100, start=None, end=None):
     if start is None:
         start = datetime.now(timezone.utc) - timedelta(days=days)
     if end is None:
         end = datetime.now(timezone.utc)
     payload = {
-        "collections": [COLLECTION],
+        "collections": [collection],
         "bbox": bbox,
         "datetime": "%s/%s" % (start.isoformat(), end.isoformat()),
         "limit": limit,
+        "sortby": [{"field": "properties.datetime", "direction": "desc"}],
     }
-    r = requests.post(EARTH_SEARCH, json=payload, timeout=45)
-    r.raise_for_status()
-    feats = r.json().get("features", [])
+    feats = []
+    next_link = {"href": endpoint, "method": "POST", "body": payload}
+    seen_pages = set()
+    while next_link:
+        method = next_link.get("method", "GET").upper()
+        href = next_link["href"]
+        body = next_link.get("body")
+        page_key = (method, href, json.dumps(body, sort_keys=True))
+        if page_key in seen_pages:
+            raise RuntimeError("STAC search returned a repeated next page")
+        seen_pages.add(page_key)
+        if method == "POST":
+            r = requests.post(href, json=body, timeout=45)
+        elif method == "GET":
+            r = requests.get(href, timeout=45)
+        else:
+            raise RuntimeError("Unsupported STAC pagination method: %s" % method)
+        r.raise_for_status()
+        page = r.json()
+        feats.extend(page.get("features", []))
+        next_link = next((link for link in page.get("links", []) if link.get("rel") == "next"), None)
     feats.sort(key=lambda x: x.get("properties", {}).get("datetime", ""), reverse=True)
     return feats
+
+
+def search_scenes(bbox, days=60, limit=100, start=None, end=None):
+    """Search Sentinel-2 scenes, newest first."""
+    return _search_catalog(EARTH_SEARCH, COLLECTION, bbox, days, limit, start, end)
+
+
+def search_landsat_scenes(bbox, days=60, limit=100, start=None, end=None):
+    """Search only Landsat 8/9 scenes with RGB and pixel-quality assets."""
+    scenes = _search_catalog(PLANETARY_SEARCH, LANDSAT_COLLECTION, bbox,
+                             days, limit, start, end)
+    needed = {"red", "green", "blue", "qa_pixel"}
+    return [item for item in scenes
+            if item.get("properties", {}).get("platform") in ("landsat-8", "landsat-9")
+            and needed.issubset(item.get("assets", {}))]
 
 
 def _read(url, bbox_wgs84, bands=None, max_dim=2048, resampling=Resampling.bilinear, point=None):
@@ -196,7 +238,7 @@ def _read(url, bbox_wgs84, bands=None, max_dim=2048, resampling=Resampling.bilin
             # Without this check the target silently falls outside the crop.
             if point is not None:
                 px, py = warp_transform("EPSG:4326", src.crs, [point[0]], [point[1]])
-                col, row = ~src.transform * (px[0], py[0])
+                col, row = ~src.transform @ (px[0], py[0])
                 pad = 2
                 if not (win.col_off + pad <= col < win.col_off + win.width - pad
                         and win.row_off + pad <= row < win.row_off + win.height - pad):
@@ -246,7 +288,56 @@ def local_obscured_percent(scl_arr):
     return float(obscured.sum()) / valid_count * 100.0
 
 
-def select_scene(feats, bbox, point, mode="latest_clear", max_cloud=20.0, candidates=20,
+def landsat_quality(qa_arr):
+    """Return local obscuration and valid coverage from Landsat 8/9 QA_PIXEL."""
+    qa = np.asarray(qa_arr)
+    if qa.ndim == 3:
+        qa = qa[0]
+    valid = (qa & 1) == 0  # Bit 0 marks fill, not a cloud-free pixel.
+    valid_count = int(valid.sum())
+    if not valid_count:
+        return None, 0.0
+    obscured = ((qa & OBSCURED_LANDSAT_BITS) != 0) & valid
+    return float(obscured.sum()) / valid_count * 100.0, float(valid.mean())
+
+
+def _planetary_token():
+    response = requests.get(PLANETARY_TOKEN, timeout=25)
+    response.raise_for_status()
+    token = response.json().get("token")
+    if not token:
+        raise RuntimeError("Planetary Computer did not return an access token")
+    return token
+
+
+def _signed_landsat_asset(asset, token):
+    href = asset["href"]
+    parsed = urlsplit(href)
+    if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".blob.core.windows.net"):
+        raise RuntimeError("Unexpected Landsat asset host")
+    return href + ("&" if parsed.query else "?") + token
+
+
+def _landsat_rgb(item, bbox, point, max_dim, token):
+    arrays = []
+    meta = None
+    for band in ("red", "green", "blue"):
+        url = _signed_landsat_asset(item["assets"][band], token)
+        got = _read(url, bbox, bands=[1], max_dim=max_dim, point=point)
+        if got is None:
+            return None
+        arr, band_meta = got
+        if arrays and arr.shape != arrays[0].shape:
+            return None
+        arrays.append(arr)
+        if meta is None:
+            meta = band_meta
+        else:
+            meta["valid_fraction"] = min(meta["valid_fraction"], band_meta["valid_fraction"])
+    return np.concatenate(arrays, axis=0), meta
+
+
+def select_scene(feats, bbox, point, mode="latest_clear", max_cloud=20.0, candidates=None,
                  min_valid=0.5, avoid=None):
     """Pick a scene whose target crop is genuinely usable.
 
@@ -258,7 +349,7 @@ def select_scene(feats, bbox, point, mode="latest_clear", max_cloud=20.0, candid
     scanned, rejected = 0, 0
     best = None
     avoid = avoid or set()
-    for it in feats[:candidates]:
+    for it in feats if candidates is None else feats[:candidates]:
         if it["id"] in avoid:
             continue
         assets = it.get("assets", {})
@@ -303,7 +394,8 @@ def save_rgb(arr, output_path, fmt="jpg", quality=92):
     elif rgb.shape[-1] != 3:
         raise RuntimeError("Expected 3-band RGB, got %d bands" % rgb.shape[-1])
     kwargs = {"quality": quality, "optimize": True} if fmt.lower() in ("jpg", "jpeg") else {"optimize": True}
-    Image.fromarray(rgb, mode="RGB").save(output_path, **kwargs)
+    image_format = "PNG" if fmt.lower() == "png" else "JPEG"
+    Image.fromarray(rgb, mode="RGB").save(output_path, format=image_format, **kwargs)
     return rgb
 
 
@@ -324,17 +416,119 @@ def _image_is_blank(path):
     return float(a.mean()) < 12.0 and float(a.std()) < 12.0
 
 
+def _parse_date_bound(value, end=False):
+    """Parse an ISO date or timestamp as a UTC search bound."""
+    if len(value) == 10:
+        day = date.fromisoformat(value)
+        return datetime.combine(day, datetime_time.max if end else datetime_time.min, timezone.utc)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_inputs(lat, lon, radius_km, max_cloud, max_age_days, max_dim,
+                     date_start, date_end):
+    if (lat is None) != (lon is None):
+        raise ValueError("Provide both --lat and --lon")
+    if lat is not None and (not math.isfinite(lat) or not -90 <= lat <= 90):
+        raise ValueError("Latitude must be between -90 and 90")
+    if lon is not None and (not math.isfinite(lon) or not -180 <= lon <= 180):
+        raise ValueError("Longitude must be between -180 and 180")
+    if not math.isfinite(radius_km) or radius_km <= 0:
+        raise ValueError("--radius-km must be positive")
+    if not math.isfinite(max_cloud) or not 0 <= max_cloud <= 100:
+        raise ValueError("--max-cloud must be between 0 and 100")
+    if max_age_days <= 0:
+        raise ValueError("--max-age-days must be positive")
+    if max_dim <= 0:
+        raise ValueError("--max-dim must be positive")
+    if date_end and not date_start:
+        raise ValueError("--date-end requires --date-start")
+    if date_start:
+        start = _parse_date_bound(date_start)
+        end = _parse_date_bound(date_end, end=True) if date_end else datetime.now(timezone.utc)
+        if end < start:
+            raise ValueError("--date-end must not precede --date-start")
+        return start, end
+    return None, None
+
+
+def _candidate_quality(item, source, bbox, point, token=None):
+    """Return (local obscuration, valid fraction), or None for an unusable crop."""
+    assets = item.get("assets", {})
+    if source == "sentinel2":
+        if "visual" not in assets:
+            return None
+        if "scl" not in assets:
+            return None, 1.0  # Only --mode latest can use a scene without SCL.
+        probe = _read(assets["scl"]["href"], bbox, bands=[1], max_dim=512,
+                      resampling=Resampling.nearest, point=point)
+        if probe is None:
+            return None
+        arr, meta = probe
+        return local_obscured_percent(arr), meta["valid_fraction"]
+    qa_url = _signed_landsat_asset(assets["qa_pixel"], token)
+    probe = _read(qa_url, bbox, bands=[1], max_dim=512,
+                  resampling=Resampling.nearest, point=point)
+    if probe is None:
+        return None
+    return landsat_quality(probe[0])
+
+
+def _candidate_rgb(item, source, bbox, point, max_dim, token=None):
+    if source == "sentinel2":
+        return _read(item["assets"]["visual"]["href"], bbox,
+                     max_dim=max_dim, point=point)
+    return _landsat_rgb(item, bbox, point, max_dim, token)
+
+
+def _save_candidate(arr, meta, destination, output_format, min_valid=0.5):
+    """Publish only a verified image; leave an existing destination untouched on failure."""
+    if meta["valid_fraction"] < min_valid:
+        return None
+    directory = os.path.dirname(os.path.abspath(destination))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=directory, suffix="." + output_format.lower())
+    os.close(fd)
+    try:
+        save_rgb(arr, temporary, fmt=output_format)
+        dimensions = verify_image(temporary)
+        if _image_is_blank(temporary):
+            return None
+        os.replace(temporary, destination)
+        return dimensions
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _output_destination(out_path, query, lat, lon, acquired, source, output_format):
+    if out_path is not None:
+        return out_path
+    safe = "".join(c if (c.isalnum() or c in "-_") else "-"
+                   for c in (query or "").strip().lower()).strip("-")
+    stem = safe or ("%.4f_%.4f" % (lat, lon))
+    sensor = "sentinel2" if source == "sentinel2" else "landsat89"
+    return os.path.join(CACHE_DIR, "%s_%s_%s.%s" % (
+        stem, acquired[:10], sensor, output_format.lower()))
+
+
 # --------------------------------------------------------------------------- #
 def get_satellite_image(query=None, lat=None, lon=None, radius_km=15, mode="latest_clear",
                         max_cloud=20.0, max_age_days=60, output_format="jpg",
                         max_dim=2048, out_path=None, country_code=None, quiet=False,
                         date_start=None, date_end=None):
     t0 = time.time()
+    start, end = _validate_inputs(lat, lon, radius_km, max_cloud, max_age_days,
+                                  max_dim, date_start, date_end)
     if lat is None or lon is None:
         if not query:
             raise RuntimeError("Provide a place query or lat/lon")
         best, ambiguous = geocode(query, country_code=country_code)
         lat, lon = best["latitude"], best["longitude"]
+        _validate_inputs(lat, lon, radius_km, max_cloud, max_age_days, max_dim,
+                         date_start, date_end)
         place = describe_place(best)
         feature = "%s (%s)" % (best.get("name"), best.get("feature_code"))
         note = None
@@ -344,73 +538,140 @@ def get_satellite_image(query=None, lat=None, lon=None, radius_km=15, mode="late
         place, feature, note = "%.4f, %.4f" % (lat, lon), None, None
 
     bbox = bbox_from_center(lat, lon, radius_km)
+    point = (lon, lat)
     days = max_age_days
-    feats = []
-    for attempt_days in (days, 120, 365) if not date_start else (days,):
-        if date_start:
-            start = datetime.fromisoformat(date_start).replace(tzinfo=timezone.utc)
-            end = (datetime.fromisoformat(date_end).replace(tzinfo=timezone.utc)
-                   if date_end else datetime.now(timezone.utc))
-            feats = search_scenes(bbox, limit=100, start=start, end=end)
-        else:
-            feats = search_scenes(bbox, days=attempt_days, limit=100)
-        if feats:
-            days = attempt_days
-            break
-    if not feats:
-        raise RuntimeError("No Sentinel-2 scenes found in the searched interval.")
-
-    # Select + fetch, retrying the next-best candidate if the rendered image
-    # turns out blank even though the scene metadata looked clear.
-    avoid = set()
-    item = local_pct = meta = rgb = None
+    windows = (days,) if date_start else (days,) + tuple(d for d in (120, 365) if d > days)
+    seen = set()
+    cloudy_candidates = []
+    selected = None
+    pc_token = None
+    pc_unavailable = False
+    pc_warning = False
+    s2_unavailable = False
+    s2_warning = False
+    any_scenes = False
     scanned = rejected = 0
-    render_attempts = 0
-    while render_attempts < 3:
-        item, local_pct, scanned, rejected = select_scene(
-            feats, bbox, (lon, lat), mode=mode, max_cloud=max_cloud, avoid=avoid
-        )
-        if item is None:
-            break
-        got = _read(item["assets"]["visual"]["href"], bbox, max_dim=max_dim, point=(lon, lat))
-        if got is None:
-            avoid.add(item["id"])
-            render_attempts += 1
-            continue
-        arr, meta = got
-        props = item["properties"]
-        acquired = props["datetime"]
-        if out_path is None:
-            safe = "".join(c if (c.isalnum() or c in "-_") else "-"
-                           for c in (query or "").strip().lower()).strip("-")
-            stem = safe or ("%.4f_%.4f" % (lat, lon))
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            out_path = os.path.join(CACHE_DIR, "%s_%s_sentinel2.%s" % (stem, acquired[:10], output_format.lower()))
-        else:
-            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-        rgb = save_rgb(arr, out_path, fmt=output_format)
-        if _image_is_blank(out_path):
-            # Near-black output: unusable. Try the next candidate.
-            avoid.add(item["id"])
-            render_attempts += 1
-            continue
-        break
-    if item is None or meta is None:
-        raise RuntimeError("No usable Sentinel-2 scene with a visual asset over this location.")
-    if _image_is_blank(out_path):
-        raise RuntimeError("Every candidate scene rendered as blank imagery for this location.")
 
-    w, h = verify_image(out_path)
+    def render(item, source, local_pct):
+        got = _candidate_rgb(item, source, bbox, point, max_dim, pc_token)
+        if got is None:
+            return None
+        arr, meta = got
+        destination = _output_destination(out_path, query, lat, lon,
+                                          item["properties"]["datetime"], source, output_format)
+        dimensions = _save_candidate(arr, meta, destination, output_format)
+        if dimensions is None:
+            return None
+        return item, source, local_pct, meta, destination, dimensions
+
+    for attempt_days in windows:
+        days = attempt_days
+        search_options = {"limit": 100, "start": start, "end": end} if date_start else {
+            "days": attempt_days, "limit": 100}
+        entries = []
+        if not s2_unavailable:
+            try:
+                entries = [("sentinel2", item) for item in search_scenes(bbox, **search_options)]
+            except requests.RequestException:
+                s2_unavailable = s2_warning = True
+        # latest retains its original Sentinel-2-only meaning. In latest_clear,
+        # a newer clear Landsat scene can win despite its lower spatial detail.
+        if mode == "latest_clear" and not pc_unavailable:
+            try:
+                entries.extend(("landsat", item) for item in search_landsat_scenes(
+                    bbox, **search_options))
+            except requests.RequestException:
+                pc_unavailable = pc_warning = True
+        any_scenes = any_scenes or bool(entries)
+        entries.sort(key=lambda pair: (
+            datetime.fromisoformat(pair[1]["properties"]["datetime"].replace("Z", "+00:00")),
+            pair[0] == "sentinel2"), reverse=True)
+        for source, item in entries:
+            identity = (source, item["id"])
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if source == "landsat" and pc_unavailable:
+                continue
+            if source == "landsat" and pc_token is None:
+                try:
+                    pc_token = _planetary_token()
+                except requests.RequestException:
+                    pc_unavailable = pc_warning = True
+                    continue
+            try:
+                quality = _candidate_quality(item, source, bbox, point, pc_token)
+            except (requests.RequestException, rasterio.errors.RasterioError, OSError):
+                rejected += 1
+                if source == "landsat":
+                    pc_warning = True
+                else:
+                    s2_warning = True
+                continue
+            if quality is None or quality[1] < 0.5 or (quality[0] is None and mode != "latest"):
+                rejected += 1
+                continue
+            local_pct = quality[0]
+            scanned += 1
+            if mode != "latest" and local_pct > max_cloud:
+                cloudy_candidates.append((source, item, local_pct))
+                continue
+            try:
+                selected = render(item, source, local_pct)
+            except (requests.RequestException, rasterio.errors.RasterioError, OSError):
+                if source == "landsat":
+                    pc_warning = True
+                else:
+                    s2_warning = True
+            if selected:
+                break
+            rejected += 1
+        if selected:
+            break
+
+    if selected is None and cloudy_candidates:
+        cloudy_candidates.sort(key=lambda entry: (
+            entry[2],
+            -datetime.fromisoformat(entry[1]["properties"]["datetime"].replace("Z", "+00:00")).timestamp()))
+        for source, item, local_pct in cloudy_candidates:
+            try:
+                selected = render(item, source, local_pct)
+            except (requests.RequestException, rasterio.errors.RasterioError, OSError):
+                if source == "landsat":
+                    pc_warning = True
+                else:
+                    s2_warning = True
+            if selected:
+                break
+            rejected += 1
+    if selected is None:
+        if s2_unavailable and pc_unavailable:
+            raise RuntimeError("Both imagery catalogs are unavailable.")
+        if pc_unavailable:
+            raise RuntimeError("Landsat fallback is unavailable and no usable Sentinel-2 scene was found.")
+        if s2_unavailable and mode == "latest":
+            raise RuntimeError("Sentinel-2 search is unavailable.")
+        if not any_scenes:
+            raise RuntimeError("No Sentinel-2 or Landsat 8/9 scenes found in the searched interval.")
+        raise RuntimeError("No usable Sentinel-2 or Landsat 8/9 scene over this location.")
+
+    item, source, local_pct, meta, selected_path, (w, h) = selected
+    props = item["properties"]
+    acquired = props["datetime"]
+    attribution = ATTRIBUTION if source == "sentinel2" else LANDSAT_ATTRIBUTION
 
     result = {
-        "path": out_path,
-        "source": ATTRIBUTION,
+        "path": selected_path,
+        "source": attribution,
         "place": place,
         "latitude": lat,
         "longitude": lon,
         "acquired": acquired,
         "scene_id": item["id"],
-        "mgrs_tile": props.get("grid:code"),
+        "mgrs_tile": props.get("grid:code") if source == "sentinel2" else None,
+        "platform": props.get("platform"),
+        "collection": COLLECTION if source == "sentinel2" else LANDSAT_COLLECTION,
+        "resolution_m": 10 if source == "sentinel2" else 30,
         "scene_cloud_percent": round(float(props.get("eo:cloud_cover", -1)), 2),
         "local_obscured_percent": None if local_pct is None else round(local_pct, 1),
         "radius_km": radius_km,
@@ -432,11 +693,19 @@ def get_satellite_image(query=None, lat=None, lon=None, radius_km=15, mode="late
                              "returning the clearest available scene." % max_cloud)
     if mode == "latest" and local_pct is not None and local_pct > max_cloud:
         result["warning"] = "Newest scene returned in latest mode; clouds obscure the target (%.0f%%)." % local_pct
+    provider_warnings = []
+    if s2_warning:
+        provider_warnings.append("Some Sentinel-2 candidates were unavailable")
+    if pc_warning:
+        provider_warnings.append("Some Landsat candidates were unavailable")
+    if provider_warnings:
+        result["provider_warning"] = "; ".join(provider_warnings) + "."
 
     if not quiet:
         ex = meta["km"]
-        print("Newest %s Sentinel-2 scene for %s" % (
-            "clear" if mode == "latest_clear" else "available", place))
+        label = "Sentinel-2" if source == "sentinel2" else "Landsat 8/9"
+        quality_label = "clear" if local_pct is not None and local_pct <= max_cloud else "available"
+        print("Newest %s %s scene for %s" % (quality_label, label, place))
         print("  Acquired     : %s UTC" % acquired.replace("T", " ").replace(".000Z", "Z"))
         print("  Area shown   : %.1f x %.1f km (requested radius %s km)" % (ex[0], ex[1], radius_km))
         print("  Obscuration  : %s over the target (scene-wide %.1f%%)" % (
@@ -445,18 +714,22 @@ def get_satellite_image(query=None, lat=None, lon=None, radius_km=15, mode="late
         print("  Data present : %.0f%% of the requested area" % (100 * meta["valid_fraction"]))
         if rejected:
             print("  Rejected     : %d candidate(s) unusable (off-target tile or mostly nodata)" % rejected)
-        print("  Tile         : %s" % props.get("grid:code"))
-        print("  Image        : %s (%dx%d)" % (out_path, w, h))
-        print("  Source       : %s" % ATTRIBUTION)
+        if source == "sentinel2":
+            print("  Tile         : %s" % props.get("grid:code"))
+        print("  Resolution   : %d m" % result["resolution_m"])
+        print("  Image        : %s (%dx%d)" % (selected_path, w, h))
+        print("  Source       : %s" % attribution)
         if result.get("warning"):
             print("  Note         : %s" % result["warning"])
+        if result.get("provider_warning"):
+            print("  Note         : %s" % result["provider_warning"])
         if note:
             print("  Geocode      : %s" % note)
     return result
 
 
 def main():
-    p = argparse.ArgumentParser(description="Newest clear Sentinel-2 image for a place.")
+    p = argparse.ArgumentParser(description="Newest clear Sentinel-2 or Landsat 8/9 image for a place.")
     p.add_argument("query", nargs="?", help="Place name, e.g. 'Emmitsburg' or 'Mount Rainier, Washington'")
     p.add_argument("--lat", type=float)
     p.add_argument("--lon", type=float)
